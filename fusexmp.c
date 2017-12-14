@@ -110,10 +110,9 @@ static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
 	(void) offset;
 	(void) fi;
-
   sprintf(fullpath, "%s%s", global_context.driveA, path);
   if(access(fullpath, 0) == -1) sprintf(fullpath, "%s%s", global_context.driveB, path);
-
+	
 	dp = opendir(fullpath);
 	if (dp == NULL)
 		return -errno;
@@ -129,44 +128,55 @@ static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	}
 
 	closedir(dp);
+	
 	return 0;
 }
 
 static int xmp_mknod(const char *path, mode_t mode, dev_t rdev)
 {
-  char fullpath[PATH_MAX];
+  char fullpaths[2][PATH_MAX];
   int res;
 
-  sprintf(fullpath, "%s%s", global_context.driveA, path);
-  if(access(fullpath, 0) != -1) sprintf(fullpath, "%s%s", global_context.driveB, path);
+  sprintf(fullpaths[0], "%s%s", global_context.driveA, path);
+  sprintf(fullpaths[1], "%s%s", global_context.driveB, path);
+
+//  sprintf(fullpath, "%s%s", global_context.driveA, path);
+//  if(access(fullpath, 0) != -1) sprintf(fullpath, "%s%s", global_context.driveB, path);
 
 	/* On Linux this could just be 'mknod(path, mode, rdev)' but this
 	   is more portable */
-	
-  if (S_ISREG(mode)) {
-    res = open(fullpath, O_CREAT | O_EXCL | O_WRONLY, mode);
-    if (res >= 0) res = close(res);
-  } 
-  else if (S_ISFIFO(mode)) res = mkfifo(fullpath, mode);
-  else res = mknod(fullpath, mode, rdev);
-    
-  if (res == -1) return -errno;
+  for(int i = 0; i < 2; ++i){
+	const char* fullpath = fullpaths[i];
 
+  	if (S_ISREG(mode)) {
+  	  res = open(fullpath, O_CREAT | O_EXCL | O_WRONLY, mode);
+  	  if (res >= 0) res = close(res);
+  	} 
+  	else if (S_ISFIFO(mode)) res = mkfifo(fullpath, mode);
+  	else res = mknod(fullpath, mode, rdev);
+  	  
+  	if (res == -1) return -errno;
+  }
   return 0;
 }
 
 static int xmp_mkdir(const char *path, mode_t mode)
 {
-  char fullpath[PATH_MAX];
+  char fullpaths[2][PATH_MAX];
   int res;
 
-  sprintf(fullpath, "%s%s", global_context.driveA, path);
-  if(access(fullpath, 0) != -1) sprintf(fullpath, "%s%s", global_context.driveB, path);
+  sprintf(fullpaths[0], "%s%s", global_context.driveA, path);
+  sprintf(fullpaths[1], "%s%s", global_context.driveB, path);
 
-  res = mkdir(fullpath, mode);
-  if (res == -1)
-      return -errno;
+//  sprintf(fullpath, "%s%s", global_context.driveA, path);
+//  if(access(fullpath, 0) != -1) sprintf(fullpath, "%s%s", global_context.driveB, path);
+  for(int i = 0; i < 2; ++i){
+	const char* fullpath = fullpaths[i];
 
+  	res = mkdir(fullpath, mode);
+  	if (res == -1)
+  	    return -errno;
+  }
   return 0;
 }
 
@@ -331,6 +341,7 @@ static int xmp_open(const char *path, struct fuse_file_info *fi)
   return 0;
 }
 
+#define HALF_STRIPE 256
 static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
     struct fuse_file_info *fi)
 {
@@ -338,54 +349,73 @@ static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
   int fd;
   int res;
   int chk = 0; // 0 = drive A, 1 = drive B
-  int offset_mod256 = offset % 256;
+  off_t offset_mod256 = offset % (off_t)HALF_STRIPE;
+  off_t offset_div512 = offset / (off_t)(HALF_STRIPE*2);
+  off_t offset1 = offset_mod256 + (offset_div512 * (off_t)HALF_STRIPE);
+  off_t offset2 = offset_div512 * (off_t)HALF_STRIPE;
+
   (void) fi;
 
-  if((offset > 256 && offset <=512) || (offset >768 && offset <= 1024))
+  offset = offset1;
+
+  if(offset % (off_t)512 > HALF_STRIPE){
 	chk = 1;
+	offset2 = offset_mod256 + (offset_div512 * (off_t)HALF_STRIPE);
+	offset1 = (offset_div512 + 1) * (off_t)HALF_STRIPE;
+	offset = offset2;
+  }
 
   if(chk == 0) sprintf(fullpath, "%s%s", global_context.driveA, path);
   else sprintf(fullpath, "%s%s", global_context.driveB, path);
 
   fd = open(fullpath, O_RDONLY);
-  if (fd == -1) return -errno;
-  
-  if(offset_mod256 + size <= 256){
+    if (fd == -1) return -errno;
+
+  if(offset_mod256 + size <= (size_t)HALF_STRIPE){
 	res = pread(fd, buf, size, offset);
 	if (res == -1) res = -errno;
 
 	close(fd);
   }
   else{
-	res = pread(fd, buf, 256 - offset_mod256, offset);
+	res = pread(fd, buf, (size_t)HALF_STRIPE - (size_t)offset_mod256, offset);
 	if (res == -1) res = -errno;
-	size = size - (256 - offset_mod256);	
-	offset = offset + (256 - offset_mod256);	
-
+	size = size - ((size_t)HALF_STRIPE - (size_t)offset_mod256);	
+	
+	if(chk == 0) offset1 = offset + ((off_t)HALF_STRIPE - (off_t)offset_mod256);
+	else offset2 = offset + ((off_t)HALF_STRIPE - (off_t)offset_mod256);
+	buf = buf + ((off_t)HALF_STRIPE - (off_t)offset_mod256);	
 	close(fd);
 
 	while(1){
 		if(chk == 0){
 			sprintf(fullpath, "%s%s", global_context.driveB, path);
 			chk = 1;
+			offset = offset2;
 		}
 		else {
 			sprintf(fullpath, "%s%s", global_context.driveA, path);
 			chk = 0;
+			offset = offset1;
 		}		
 		fd = open(fullpath, O_RDONLY);
 		if (fd == -1) return -errno;
 		
-		if(size > 256){
-			res = pread(fd, buf, 256, offset);
-			if (res == -1) res = -errno;
-			size = size - 256;
-			offset = offset + 256;
+		if(size > HALF_STRIPE){
+			res = pread(fd, buf, HALF_STRIPE, offset);
+			if (res == -1) res = -errno;	
+			size = size - HALF_STRIPE;
+			if(chk == 0) offset1 = offset + HALF_STRIPE;
+			else offset2 = offset + HALF_STRIPE;
+			buf = buf + HALF_STRIPE;
 			close(fd);
 		}
 		else{
 			res = pread(fd, buf, size, offset);
 			if (res == -1) res = -errno;
+			if(chk == 0) offset1 = offset + size;
+			else offset2 = offset + size;
+			buf = buf + size;
 			close(fd);
 			break;
 		}
@@ -401,12 +431,21 @@ static int xmp_write(const char *path, const char *buf, size_t size,
   int fd;
   int res;
   int chk = 0; // 0 = drive A, 1 = drive B
-  int offset_mod256 = offset % 256;
+  off_t offset_mod256 = offset % (off_t)HALF_STRIPE;
+  off_t offset_div512 = offset / (off_t)(HALF_STRIPE*2);
+  off_t offset1 = offset_mod256 + (offset_div512 * (off_t)HALF_STRIPE);
+  off_t offset2 = offset_div512 * (off_t)HALF_STRIPE;
 
   (void) fi;
 
-  if((offset > 256 && offset <=512) || (offset >768 && offset <= 1024))
+  offset = offset1;
+
+  if(offset % (off_t)512 > HALF_STRIPE){
 	chk = 1;
+	offset2 = offset_mod256 + (offset_div512 * (off_t)HALF_STRIPE);
+	offset1 = (offset_div512 + 1) * (off_t)HALF_STRIPE;
+	offset = offset2;
+  }
 
   if(chk == 0) sprintf(fullpath, "%s%s", global_context.driveA, path);
   else sprintf(fullpath, "%s%s", global_context.driveB, path);
@@ -414,41 +453,51 @@ static int xmp_write(const char *path, const char *buf, size_t size,
   fd = open(fullpath, O_WRONLY);
     if (fd == -1) return -errno;
 
-  if(offset_mod256 + size <= 256){
+  if(offset_mod256 + size <= (size_t)HALF_STRIPE){
 	res = pwrite(fd, buf, size, offset);
 	if (res == -1) res = -errno;
 
 	close(fd);
   }
   else{
-	res = pwrite(fd, buf, 256 - offset_mod256, offset);
+	res = pwrite(fd, buf, (size_t)HALF_STRIPE - (size_t)offset_mod256, offset);
 	if (res == -1) res = -errno;
-	size = size - (256 - offset_mod256);	
-	offset = offset + (256 - offset_mod256);
+	size = size - ((size_t)HALF_STRIPE - (size_t)offset_mod256);	
+	
+	if(chk == 0) offset1 = offset + ((off_t)HALF_STRIPE - (off_t)offset_mod256);
+	else offset2 = offset + ((off_t)HALF_STRIPE - (off_t)offset_mod256);
+	buf = buf + ((off_t)HALF_STRIPE - (off_t)offset_mod256);
 	close(fd);
 
 	while(1){
 		if(chk == 0){
 			sprintf(fullpath, "%s%s", global_context.driveB, path);
 			chk = 1;
+			offset = offset2;
 		}
 		else {
 			sprintf(fullpath, "%s%s", global_context.driveA, path);
 			chk = 0;
+			offset = offset1;
 		}		
-		fd = open(fullpath, O_RDONLY);
+		fd = open(fullpath, O_WRONLY);
 		if (fd == -1) return -errno;
 		
-		if(size > 256){
-			res = pwrite(fd, buf, 256, offset);
-			if (res == -1) res = -errno;
-			size = size - 256;
-			offset = offset + 256;
+		if(size > HALF_STRIPE){
+			res = pwrite(fd, buf, HALF_STRIPE, offset);
+			if (res == -1) res = -errno;	
+			size = size - HALF_STRIPE;
+			if(chk == 0) offset1 = offset + HALF_STRIPE;
+			else offset2 = offset + HALF_STRIPE;
+			buf = buf + (off_t)HALF_STRIPE;
 			close(fd);
 		}
 		else{
 			res = pwrite(fd, buf, size, offset);
 			if (res == -1) res = -errno;
+			if(chk == 0) offset1 = offset + size;
+			else offset2 = offset + size;
+			buf = buf + size;
 			close(fd);
 			break;
 		}
